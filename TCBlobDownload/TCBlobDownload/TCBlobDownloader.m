@@ -364,10 +364,26 @@ NSString * const TCBlobDownloadErrorHTTPStatusKey = @"TCBlobDownloadErrorHTTPSta
     }
 
     // Add the sample
-    [self.samplesOfDownloadedBytes addObject:[NSNumber numberWithUnsignedLongLong:self.receivedDataLength - self.previousTotal]];
+    NSUInteger sampleSpeed = (NSUInteger)self.receivedDataLength - (NSUInteger)self.previousTotal;
+    NSLog(@"%s: sampleSpeed=: %lu", __func__, (unsigned long)sampleSpeed);
+    [self.samplesOfDownloadedBytes addObject:[NSNumber numberWithUnsignedInteger:sampleSpeed]];
+    
     self.previousTotal = self.receivedDataLength;
     // Compute the speed rate on the average of the last seconds samples
-    self.speedRate = [[self.samplesOfDownloadedBytes valueForKeyPath:@"@avg.longValue"] longValue];
+    NSLog(@"%s: samples: %@",__func__, self.samplesOfDownloadedBytes);
+    
+    NSUInteger sum = 0.0f;
+    for (NSNumber *number in self.samplesOfDownloadedBytes) {
+        sum += [number unsignedIntegerValue];
+        NSLog(@"%s: number=: %@ sum=: %lu", __func__, number, (unsigned long)sum);
+    }
+    
+    NSUInteger newSpeed = (NSUInteger)(sum / [self.samplesOfDownloadedBytes count]);
+    NSLog(@"%s: newSpeed=: %lu", __func__, (unsigned long)newSpeed);
+    
+    if (newSpeed > 0) {
+        self.speedRate = newSpeed;
+    }
 }
 
 - (BOOL)removeFileWithError:(NSError *__autoreleasing *)error
@@ -402,12 +418,12 @@ NSString * const TCBlobDownloadErrorHTTPStatusKey = @"TCBlobDownloadErrorHTTPSta
 
 - (NSInteger)remainingTime
 {
-    return self.speedRate > 0 ? ((NSInteger) (self.expectedDataLength - self.receivedDataLength) / self.speedRate) : -1;
+    return self.speedRate > 0 ? ((NSInteger) ((float)self.expectedDataLength - (float)self.receivedDataLength) / (float)self.speedRate) : -1;
 }
 
-- (float)progress
+- (CGFloat)progress
 {
-    return (_expectedDataLength == 0) ? 0 : (float) self.receivedDataLength / (float) self.expectedDataLength;
+    return (_expectedDataLength == 0) ? 0 : (float)self.receivedDataLength / (float)self.expectedDataLength;
 }
 
 @end
