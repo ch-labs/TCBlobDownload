@@ -157,7 +157,7 @@ typedef NS_ENUM(NSUInteger, TCBlobDownloadState) {
  
  Value between 0 and 1
  */
-@property (nonatomic, assign, readonly, getter = progress) CGFloat progress;
+@property (nonatomic, assign, readonly, getter = progress) double progress;
 
 /**
  Current state of the download.
