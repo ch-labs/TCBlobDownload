@@ -1,289 +1,429 @@
 //
-//  TCBlobDownloader.h
+//  TCBlobDownload.m
 //
 //  Created by Thibault Charbonnier on 15/04/13.
 //  Copyright (c) 2013 Thibault Charbonnier. All rights reserved.
 //
 
-#define NO_LOG
-#if defined(DEBUG) && !defined(NO_LOG)
-    #define TCLog(format, ...) NSLog(format, ## __VA_ARGS__)
-#else
-    #define TCLog(format, ...)
-#endif
+static const double kBufferSize = 1000*1000; // 1 MB
+static const NSTimeInterval kDefaultRequestTimeout = 30;
+static const NSInteger kNumberOfSamples = 5;
 
-#import <Foundation/Foundation.h>
-#import <CoreGraphics/CoreGraphics.h>
+NSString * const TCBlobDownloadErrorDomain = @"com.thibaultcha.tcblobdownload";
+NSString * const TCBlobDownloadErrorHTTPStatusKey = @"TCBlobDownloadErrorHTTPStatusKey";
 
-/**
- When a download fails because of an HTTP error, the HTTP status code is transmitted as an `NSNumber` via the provided `NSError` parameter of the corresponding block or delegate method. Access to `error.userInfos[TCBlobDownloadErrorHTTPStatusKey]`
- 
- @see -download:didStopWithError:
- 
- @since 1.5.0
- */
-extern NSString * const TCBlobDownloadErrorHTTPStatusKey;
+#import "TCBlobDownloader.h"
 
-/**
- TCBlobDownload specific errors
- 
- @since 2.1.0
-*/
-extern NSString * const TCBlobDownloadErrorDomain;
+@interface TCBlobDownloader ()
+// Public
+@property (nonatomic, strong, readwrite) NSMutableURLRequest *fileRequest;
+@property (nonatomic, copy, readwrite) NSURL *downloadURL;
+@property (nonatomic, copy, readwrite) NSString *pathToFile;
+@property (nonatomic, copy, readwrite) NSString *pathToDownloadDirectory;
+@property (nonatomic, assign, readwrite) TCBlobDownloadState state;
+// Download
+@property (nonatomic, strong) NSURLConnection *connection;
+@property (nonatomic, strong) NSMutableData *receivedDataBuffer;
+@property (nonatomic, strong) NSFileHandle *file;
+// Speed rate and remaining time
+@property (nonatomic, strong) NSTimer *speedTimer;
+@property (nonatomic, strong) NSMutableArray *samplesOfDownloadedBytes;
+@property (nonatomic, assign) uint64_t expectedDataLength;
+@property (nonatomic, assign) uint64_t receivedDataLength;
+@property (nonatomic, assign) uint64_t previousTotal;
+@property (nonatomic, assign, readwrite) NSInteger speedRate;
+@property (nonatomic, assign, readwrite) NSInteger remainingTime;
+// Blocks
+@property (nonatomic, copy) void (^firstResponseBlock)(NSURLResponse *response);
+@property (nonatomic, copy) void (^progressBlock)(uint64_t receivedLength, uint64_t totalLength, NSInteger remainingTime, float progress);
+@property (nonatomic, copy) void (^errorBlock)(NSError *error);
+@property (nonatomic, copy) void (^completeBlock)(BOOL downloadFinished, NSString *pathToFile);
 
-/**
- The possible error codes for a `TCBlobDownloader` operation. When an error block or the corresponding delegate method are called, an `NSError` instance is passed as parameter. If the domain of this `NSError` is TCBlobDownload's, the `code` parameter will be set to one of these values.
- 
- @since 1.5.0
- */
-typedef NS_ENUM(NSUInteger, TCBlobDownloadError) {
-    /** `NSURLConnection` was unable to handle the provided request. */
-    TCBlobDownloadErrorInvalidURL = 0,
-    /** The connection encountered an HTTP error. Please refer to `TCHTTPStatusCode` documentation for further details on how to handle such errors. */
-    TCBlobDownloadErrorHTTPError,
-    /** The device has not enough free disk space to download the file. */
-    TCBlobDownloadErrorNotEnoughFreeDiskSpace
-};
++ (NSNumber *)freeDiskSpace;
 
-/**
- The current state of the download.
- 
- @since 1.5.2
- */
-typedef NS_ENUM(NSUInteger, TCBlobDownloadState) {
-    /** The download is instanciated but has not been started yet. */
-    TCBlobDownloadStateReady = 0,
-    /** The download has started the HTTP connection to retrieve the file. */
-    TCBlobDownloadStateDownloading,
-    /** The download has been completed successfully. */
-    TCBlobDownloadStateDone,
-    /** The download has been cancelled manually. */
-    TCBlobDownloadStateCancelled,
-    /** The download failed, probably because of an error. It is possible to access the error in the appropriate delegate method or block property. */
-    TCBlobDownloadStateFailed
-};
+- (void)finishOperationWithState:(TCBlobDownloadState)state;
+- (void)notifyFromCompletionWithError:(NSError *)error pathToFile:(NSString *)pathToFile;
+- (void)updateTransferRate;
+- (BOOL)removeFileWithError:(NSError *__autoreleasing *)error;
+@end
 
-@protocol TCBlobDownloaderDelegate;
+@implementation TCBlobDownloader
+@dynamic pathToFile;
+@dynamic remainingTime;
 
 
-#pragma mark - TCBlobDownloader
+#pragma mark - Dealloc
 
 
-/**
- `TCBlobDownloader` is a subclass of Cocoa's `NSOperation`. It's purpose is to be executed by the `TCBlobDownloaderManager` singleton to download large files in background threads.
- 
- Each `TCBlobDownloader` instance will run in a background thread and will download files via an `NSURLConnection`. Each `TCBlobDownloader` can depend (or not) of a `TCBlobDownloaderDelegate` or use blocks to notify your UI from its status.
- 
- @see TCBlobDownloaderDelegate protocol
- 
- @since 1.0
- */
-@interface TCBlobDownloader : NSOperation <NSURLConnectionDelegate>
+- (void)dealloc
+{
+    [self.speedTimer invalidate];
+}
 
-/**
- The delegate property of a `TCBlobDownloader` instance. Can be `nil`.
- 
- @since 1.0
- */
-@property (nonatomic, unsafe_unretained) id<TCBlobDownloaderDelegate> delegate;
 
-/**
- The directory where the file is being downloaded.
+#pragma mark - Init
 
- @since 1.0
- */
-@property (nonatomic, copy, readonly) NSString *pathToDownloadDirectory;
 
-/**
- The path to the downloaded file, including the file name.
- 
- @warning You should not set this property directly as the file name is managed by the library.
- 
- @since 1.0
- */
-@property (nonatomic, copy, readonly, getter = pathToFile) NSString *pathToFile;
-
-/**
- The URL of the file to download.
- 
- @warning You should not set this property directly, as it is managed by the initialization method.
- 
- @since 1.0
- */
-@property (nonatomic, copy, readonly) NSURL *downloadURL;
-
-/**
- The NSMutableURLRequest that will be performed by the NSURLConnection. Use this object to pass custom headers to your request if needed.
- 
- @since 1.6.0
- */
-@property (nonatomic, strong, readonly) NSMutableURLRequest *fileRequest;
-
-/**
- If not manually set, the file name, which is by default based on the last path component of the download URL.
- 
- ## Note
- 
- You should not change the file name during the download process. The file name of a file downloaded by TCBlobDownload is the last part of the URL used to download it. This allow TCBlobDownload to check if a part of that file has already been downloaded and if so, retrieve the downloaded from where it has previously stopped. It is up to you to manage your download paths to avoid downloading 2 files with the same name.
-
- You can change the file name once the file has been downloaded in the completion block or the appropriate delegate method.
- 
- @see TCBlobDownloaderDelegate protocol
- 
- @warning It is not recommended to set this property directly, as it is retrieved from the download URL and will allow you to resume a download from where it stopped.
- 
- @since 1.0
- */
-@property (nonatomic, copy, getter = fileName) NSString *fileName;
-
-/**
- The current speed of the download in bits/sec. This property updates itself regularly so you can retrieve it on a regular interval to update your UI.
- 
- @since 1.5.0
- */
-@property (nonatomic, assign, readonly) NSInteger speedRate;
-
-/**
- The estimated number of seconds before the download completes.
- 
- `-1` if the remaining time has not been calculated yet.
- 
- @since 1.5.0
- */
-@property (nonatomic, assign, readonly, getter = remainingTime) NSInteger remainingTime;
-
-/**
- Current progress of the download.
- 
- Value between 0 and 1
- */
-@property (nonatomic, assign, readonly, getter = progress) double progress;
-
-/**
- Current state of the download.
- */
-@property (nonatomic, assign, readonly) TCBlobDownloadState state;
-
-/**
- Instanciates a `TCBlobDownloader` object with delegate. `TCBlobDownloader` objects instanciated this way will not be executed until they are passed to the `TCBlobDownloaderManager` singleton.
- 
- @see startDownload:
- 
- @param url  The URL from where to download the file.
- @param pathToDLOrNil  An optional path to override the default download path of the `TCBlobDownloaderManager` instance. Can be `nil`.
- @param delegateOrNil  An optional delegate. Can be `nil`.
- @return The newly created `TCBlobDownloader`.
- 
- @since 1.0
- */
 - (instancetype)initWithURL:(NSURL *)url
                downloadPath:(NSString *)pathToDL
-                   delegate:(id<TCBlobDownloaderDelegate>)delegateOrNil;
+                   delegate:(id<TCBlobDownloaderDelegate>)delegateOrNil
+{
+    self = [super init];
+    if (self) {
+        self.downloadURL = url;
+        self.delegate = delegateOrNil;
+        self.pathToDownloadDirectory = pathToDL;
+        self.state = TCBlobDownloadStateReady;
+        self.fileRequest = [NSMutableURLRequest requestWithURL:self.downloadURL
+                                                   cachePolicy:NSURLRequestUseProtocolCachePolicy
+                                               timeoutInterval:kDefaultRequestTimeout];
+    }
+    return self;
+}
 
-/**
- Instanciates a `TCBlobDownloader` object with response blocks. `TCBlobDownloader` objects instanciated this way will not be executed until they are passed to the `TCBlobDownloaderManager` singleton.
- 
- @see startDownload:
- 
- @param url  The URL of the file to download.
- @param customPathOrNil  An optional path to override the default download path of the `TCBlobDownloaderManager` instance. Can be `nil`.
- @param firstResponseBlock  This block is called when receiving the first response from the server. Can be `nil`.
- @param progressBlock  This block is called on each response from the server while the download is occurring. Can be `nil`. If the remaining time has not been calculated yet, the value is `-1`.
- @param errorBlock  Called when an error occur during the download. If this block is called, the download will be cancelled just after. Can be `nil`.
- @param completeBlock  Called when the download is completed or cancelled. Can be `nil`. If the download has been cancelled with the paramater `removeFile` set to `YES`, then the `pathToFile` parameter is `nil`. The `TCBlobDownloader` operation will be removed from `TCBlobDownloadManager` just after this block is called.
- @return The newly created `TCBlobDownloader`.
- 
- @since 1.3
- */
 - (instancetype)initWithURL:(NSURL *)url
                downloadPath:(NSString *)pathToDL
               firstResponse:(void (^)(NSURLResponse *response))firstResponseBlock
                    progress:(void (^)(uint64_t receivedLength, uint64_t totalLength, NSInteger remainingTime, float progress))progressBlock
                       error:(void (^)(NSError *error))errorBlock
-                   complete:(void (^)(BOOL downloadFinished, NSString *pathToFile))completeBlock;
-
-/**
- Cancels the download. Remove already downloaded parts of the file from the disk is asked.
- 
- @param remove  If `YES`, this method will remove the downloaded file parts from the disk. File parts are left untouched if set to `NO`. This will allow TCBlobDownload to restart the download from where it has ended in a future operation.
- 
- @since 1.0
- */
-- (void)cancelDownloadAndRemoveFile:(BOOL)remove;
-
-/**
- Makes the receiver download dependent of the given download. The receiver download will not execute itself until the given download has finished.
- 
- @param download  The TCBlobDownloader on which to depend.
- 
- @since 1.2
- */
-- (void)addDependentDownload:(TCBlobDownloader *)download;
-
-@end
+                   complete:(void (^)(BOOL downloadFinished, NSString *pathToFile))completeBlock
+{
+    self = [self initWithURL:url downloadPath:pathToDL delegate:nil];
+    if (self) {
+        self.firstResponseBlock = firstResponseBlock;
+        self.progressBlock = progressBlock;
+        self.errorBlock = errorBlock;
+        self.completeBlock = completeBlock;
+    }
+    return self;
+}
 
 
-#pragma mark - TCBlobDownloader Delegate
+#pragma mark - NSOperation Override
 
 
-/**
- The `TCBlobDownloaderDelegate` protocol defines the methods supported by `TCBlobDownloader` to notify you of the state of the download.
- */
-@protocol TCBlobDownloaderDelegate <NSObject>
-@optional
-/**
- Optional. Called when the `TCBlobDownloader` object has received the first response from the server.
- 
- @param blobDownload  The `TCBlobDownloader` object receiving the first response.
- @param response  The `NSURLResponse` from the server.
- 
- @since 1.0
- */
-- (void)download:(TCBlobDownloader *)blobDownload didReceiveFirstResponse:(NSURLResponse *)response;
+- (void)start
+{
+    // If we can't handle the request, better cancelling the operation right now
+    if (![NSURLConnection canHandleRequest:self.fileRequest]) {
+        NSError *error = [NSError errorWithDomain:TCBlobDownloadErrorDomain
+                                             code:TCBlobDownloadErrorInvalidURL
+                                         userInfo:@{ NSLocalizedDescriptionKey:
+                                        [NSString stringWithFormat:@"Invalid URL provided: %@", self.fileRequest.URL] }];
 
-/**
- Optional. Called on each response from the server while the download is occurring.
- 
- @param blobDownload  The `TCBlobDownloader` object which received data.
- @param receivedLength  The total number of already received bytes.
- @param totalLength  The total number of bytes of the file.
- @param progress  A value between 0 and 1 defining the progress of the download.
- 
- ## Note
- 
- If you pause and restart later a download, the new `TCBlobDownloader` will resume it from where it has stopped (see `fileName` property for more explanations). Therefore, you might want to track yourself the total size of the file when you first tried to download it, otherwise the `totalLength` is the actual remaining length to download and might not suit your needs if you do something such as a progress bar.
- 
- @since 1.0
- */
-- (void)download:(TCBlobDownloader *)blobDownload
-  didReceiveData:(uint64_t)receivedLength
-         onTotal:(uint64_t)totalLength
-        progress:(float)progress;
+        [self notifyFromCompletionWithError:error pathToFile:nil];
+        return;
+    }
 
-/**
- Optional. Called when an error occur during the download. If this method is called, the `TCBlobDownloader` will be automatically cancelled just after, without deleting the the already downloaded parts of the file. This is done by calling `cancelDownloadAndRemoveFile:`
- 
- @see cancelDownloadAndRemoveFile:
- 
- @param blobDownload  The `TCBlobDownloader` object which trigerred an error.
- @param error  The trigerred error.
- 
- @since 1.0
- */
-- (void)download:(TCBlobDownloader *)blobDownload
-didStopWithError:(NSError *)error;
+    NSFileManager *fm = [NSFileManager defaultManager];
 
-/**
- Optional. Called when the download is finished or when the operation has been cancelled. The `TCBlobDownloader` operation will be removed from `TCBlobDownloadManager` just after this method is called.
- 
- @param blobDownload  The `TCBlobDownloader` object whose execution is finished.
- @param downloadFinished  `YES` if the file has been downloaded, `NO` if not.
- @param pathToFile  The path where the file has been downloaded.
- 
- @since 1.3
- */
-- (void)download:(TCBlobDownloader *)blobDownload
-didFinishWithSuccess:(BOOL)downloadFinished
-          atPath:(NSString *)pathToFile;
+    // Create download directory
+    NSError *createDirError = nil;
+    if (![fm createDirectoryAtPath:self.pathToDownloadDirectory
+       withIntermediateDirectories:YES
+                        attributes:nil
+                             error:&createDirError]) {
+        [self notifyFromCompletionWithError:createDirError pathToFile:nil];
+        return;
+    }
+    
+    // Test if file already exists (partly downloaded) to set HTTP `bytes` header or not
+    if (![fm fileExistsAtPath:self.pathToFile]) {
+        [fm createFileAtPath:self.pathToFile
+                    contents:nil
+                  attributes:nil];
+    }
+    else {
+        uint64_t fileSize = [[fm attributesOfItemAtPath:self.pathToFile error:nil] fileSize];
+        NSString *range = [NSString stringWithFormat:@"bytes=%lld-", fileSize];
+        [self.fileRequest setValue:range forHTTPHeaderField:@"Range"];
+        // Allow progress to reflect what's already downloaded
+        self.receivedDataLength += fileSize;
+    }
+
+    // Initialization of everything we'll need to download the file
+    self.file = [NSFileHandle fileHandleForWritingAtPath:self.pathToFile];
+    self.receivedDataBuffer = [[NSMutableData alloc] init];
+    self.samplesOfDownloadedBytes = [[NSMutableArray alloc] init];
+    self.connection = [[NSURLConnection alloc] initWithRequest:self.fileRequest
+                                                  delegate:self
+                                          startImmediately:NO];
+    
+    if (self.connection && ![self isCancelled]) {
+        [self willChangeValueForKey:@"isExecuting"];
+        self.state = TCBlobDownloadStateDownloading;
+        [self didChangeValueForKey:@"isExecuting"];
+        
+        [self.file seekToEndOfFile];
+        
+        // Start the download
+        NSRunLoop* runLoop = [NSRunLoop currentRunLoop];
+        [self.connection scheduleInRunLoop:runLoop
+                                   forMode:NSDefaultRunLoopMode];
+        [self.connection start];
+
+        // Start the speed timer to schedule speed download on a periodic basis
+        self.speedTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
+                                                           target:self
+                                                         selector:@selector(updateTransferRate)
+                                                         userInfo:nil
+                                                          repeats:YES];
+        [runLoop addTimer:self.speedTimer forMode:NSRunLoopCommonModes];
+        [runLoop run];
+    }
+}
+
+- (BOOL)isExecuting
+{
+    return self.state == TCBlobDownloadStateDownloading;
+}
+
+- (BOOL)isCancelled
+{
+    return self.state == TCBlobDownloadStateCancelled;
+}
+
+- (BOOL)isFinished
+{
+    return self.state == TCBlobDownloadStateCancelled || self.state == TCBlobDownloadStateDone || self.state == TCBlobDownloadStateFailed;
+}
+
+
+#pragma mark - NSURLConnection Delegate
+
+
+- (void)connection:(NSURLConnection*)connection didFailWithError:(NSError *)error
+{
+    [self notifyFromCompletionWithError:error pathToFile:self.pathToFile];
+}
+
+- (void)connection:(NSURLConnection*)connection didReceiveResponse:(NSURLResponse *)response
+{
+    // If anything was previousy downloaded, add it to the total expected length for the progress property
+    self.expectedDataLength = self.receivedDataLength + [response expectedContentLength];
+
+    NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse *)response;
+    NSError *error;
+    if (httpResponse.statusCode >= 400) {
+        error = [NSError errorWithDomain:TCBlobDownloadErrorDomain
+                                    code:TCBlobDownloadErrorHTTPError
+                                userInfo:@{ NSLocalizedDescriptionKey:[NSString stringWithFormat:@"Erroneous HTTP status code %ld (%@)",
+                                                                       (long) httpResponse.statusCode,
+                                                                       [NSHTTPURLResponse localizedStringForStatusCode:httpResponse.statusCode]],
+                                            TCBlobDownloadErrorHTTPStatusKey: @(httpResponse.statusCode) }];
+    }
+
+    long long expected = @(self.expectedDataLength).longLongValue;
+    if ([TCBlobDownloader freeDiskSpace].longLongValue < expected && expected != -1) {
+        error = [NSError errorWithDomain:TCBlobDownloadErrorDomain
+                                    code:TCBlobDownloadErrorNotEnoughFreeDiskSpace
+                                userInfo:@{ NSLocalizedDescriptionKey:@"Not enough free disk space" }];
+    }
+
+    if (!error) {
+        [self.receivedDataBuffer setData:nil];
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (self.firstResponseBlock) {
+                self.firstResponseBlock(response);
+            }
+            if ([self.delegate respondsToSelector:@selector(download:didReceiveFirstResponse:)]) {
+                [self.delegate download:self didReceiveFirstResponse:response];
+            }
+        });
+    }
+    else {
+        [self notifyFromCompletionWithError:error pathToFile:self.pathToFile];
+    }
+}
+
+- (void)connection:(NSURLConnection*)connection didReceiveData:(NSData *)data
+{
+    [self.receivedDataBuffer appendData:data];
+    self.receivedDataLength += [data length];
+
+    TCLog(@"%@ | %.2f%% - Received: %ld - Total: %ld",
+          self.pathToFile,
+          (float) self.receivedDataLength / self.expectedDataLength * 100,
+          (long) self.receivedDataLength, (long) self.expectedDataLength);
+
+    if (self.receivedDataBuffer.length > kBufferSize && [self isExecuting]) {
+        [self.file writeData:self.receivedDataBuffer];
+        [self.receivedDataBuffer setData:nil];
+    }
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self.progressBlock) {
+            self.progressBlock(self.receivedDataLength, self.expectedDataLength, self.remainingTime, self.progress);
+        }
+        if ([self.delegate respondsToSelector:@selector(download:didReceiveData:onTotal:progress:)]) {
+            [self.delegate download:self
+                     didReceiveData:self.receivedDataLength
+                            onTotal:self.expectedDataLength
+                           progress:self.progress];
+        }
+    });
+}
+
+- (void)connectionDidFinishLoading:(NSURLConnection*)connection
+{
+    if ([self isExecuting]) {
+        [self.file writeData:self.receivedDataBuffer];
+        [self.receivedDataBuffer setData:nil];
+        
+        [self notifyFromCompletionWithError:nil pathToFile:self.pathToFile];
+    }
+}
+
+
+#pragma mark - Public Methods
+
+
+- (void)cancelDownloadAndRemoveFile:(BOOL)remove
+{
+    // Cancel the connection before deleting the file
+    [self.connection cancel];
+    
+    if (remove) {
+        NSError *error;
+        if (![self removeFileWithError:&error]) {
+            [self notifyFromCompletionWithError:error pathToFile:nil];
+            return;
+        }
+    }
+    
+    [self cancel];
+}
+
+- (void)addDependentDownload:(TCBlobDownloader *)download
+{
+    [self addDependency:download];
+}
+
+
+#pragma mark - Internal Methods
+
+
+- (void)finishOperationWithState:(TCBlobDownloadState)state
+{    
+    // Cancel the connection in case cancel was called directly
+    [self.connection cancel];
+    [self.speedTimer invalidate];
+    [self.file closeFile];
+    
+    // Let's finish the operation once and for all
+    [self willChangeValueForKey:@"isFinished"];
+    [self willChangeValueForKey:@"isExecuting"];
+    self.state = state;
+    [self didChangeValueForKey:@"isExecuting"];
+    [self didChangeValueForKey:@"isFinished"];
+}
+
+- (void)cancel
+{
+    [self willChangeValueForKey:@"isCancelled"];
+    [self finishOperationWithState:TCBlobDownloadStateCancelled];
+    [self didChangeValueForKey:@"isCancelled"];
+}
+
+- (void)notifyFromCompletionWithError:(NSError *)error pathToFile:(NSString *)pathToFile
+{
+    BOOL success = error == nil;
+    
+    // Notify from error if any
+    if (error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (self.errorBlock) {
+                self.errorBlock(error);
+            }
+            if ([self.delegate respondsToSelector:@selector(download:didStopWithError:)]) {
+                [self.delegate download:self didStopWithError:error];
+            }
+        });
+    }
+
+    // Notify from completion if the operation
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self.completeBlock) {
+            self.completeBlock(success, pathToFile);
+        }
+        if ([self.delegate respondsToSelector:@selector(download:didFinishWithSuccess:atPath:)]) {
+            [self.delegate download:self didFinishWithSuccess:success atPath:pathToFile];
+        }
+    });
+    
+    // Finish the operation
+    TCBlobDownloadState finalState = success ? TCBlobDownloadStateDone : TCBlobDownloadStateFailed;
+    [self finishOperationWithState:finalState];
+}
+
+- (void)updateTransferRate
+{
+    if (self.samplesOfDownloadedBytes.count > kNumberOfSamples) {
+        [self.samplesOfDownloadedBytes removeObjectAtIndex:0];
+    }
+
+    // Add the sample
+    NSUInteger sampleSpeed = (NSUInteger)self.receivedDataLength - (NSUInteger)self.previousTotal;
+    NSLog(@"%s: sampleSpeed=: %lu", __func__, (unsigned long)sampleSpeed);
+    [self.samplesOfDownloadedBytes addObject:[NSNumber numberWithUnsignedInteger:sampleSpeed]];
+    
+    self.previousTotal = self.receivedDataLength;
+    // Compute the speed rate on the average of the last seconds samples
+    NSLog(@"%s: samples: %@",__func__, self.samplesOfDownloadedBytes);
+    
+    NSUInteger sum = 0.0f;
+    for (NSNumber *number in self.samplesOfDownloadedBytes) {
+        sum += [number unsignedIntegerValue];
+        NSLog(@"%s: number=: %@ sum=: %lu", __func__, number, (unsigned long)sum);
+    }
+    
+    NSUInteger newSpeed = (NSUInteger)(sum / [self.samplesOfDownloadedBytes count]);
+    NSLog(@"%s: newSpeed=: %lu", __func__, (unsigned long)newSpeed);
+    
+    if (newSpeed > 0) {
+        self.speedRate = newSpeed;
+    }
+}
+
+- (BOOL)removeFileWithError:(NSError *__autoreleasing *)error
+{
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if ([fm fileExistsAtPath:self.pathToFile]) {
+        return [fm removeItemAtPath:self.pathToFile error:error];
+    }
+    
+    return YES;
+}
+
++ (NSNumber *)freeDiskSpace
+{
+    NSDictionary *fattributes = [[NSFileManager defaultManager] attributesOfFileSystemForPath:NSHomeDirectory() error:nil];
+    return [fattributes objectForKey:NSFileSystemFreeSize];
+}
+
+
+#pragma mark - Custom Getters
+
+
+- (NSString *)fileName
+{
+    return _fileName ? _fileName : [[NSURL URLWithString:[self.downloadURL absoluteString]] lastPathComponent];
+}
+
+- (NSString *)pathToFile
+{
+    return [self.pathToDownloadDirectory stringByAppendingPathComponent:self.fileName];
+}
+
+- (NSInteger)remainingTime
+{
+    return self.speedRate > 0 ? ((NSInteger) ((double)self.expectedDataLength - (double)self.receivedDataLength) / (double)self.speedRate) : -1;
+}
+
+- (double)progress
+{
+    return (_expectedDataLength == 0) ? 0 : (double)self.receivedDataLength / (double)self.expectedDataLength;
+}
 
 @end
